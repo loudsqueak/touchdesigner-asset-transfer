@@ -34,3 +34,6 @@ briefs/
 
 # TouchDesigner import cache (regenerated)
 TDImportCache/
+
+# send CLI: per-computer address and token
+cli/settings.json

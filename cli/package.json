@@ -1,0 +1,11 @@
+{
+  "name": "asset-transfer-cli",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "cli": "bun run src/tui.ts",
+    "send": "bun run src/send.ts",
+    "setup": "bun run src/setup.ts",
+    "test": "bun test"
+  }
+}
