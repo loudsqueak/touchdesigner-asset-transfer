@@ -208,3 +208,118 @@ class TestCroc(Base):
 
 if __name__ == '__main__':
 	unittest.main()
+
+
+def make_zip(path, entries):
+	import zipfile
+	with zipfile.ZipFile(path, 'w') as zf:
+		for name, data in entries.items():
+			zf.writestr(name, data)
+	return path
+
+
+class TestDeliver(Base):
+	def test_routes_artwork_plugin_and_folder(self):
+		t = self.staging / 't1'
+		t.mkdir()
+		(t / 'clip.mp4').write_bytes(b'v')
+		(t / 'cue.tox').write_bytes(b'p')
+		(t / 'cue.json').write_bytes(b'{}')
+		(t / 'piece').mkdir()
+		(t / 'piece' / 'piece.tox').write_bytes(b't')
+		(t / 'piece' / 'media').mkdir()
+		(t / 'piece' / 'media' / 'a.png').write_bytes(b'i')
+		plan = {'items': {'clip.mp4': 'artwork', 'cue.tox': 'plugin', 'cue.json': 'plugin', 'piece': 'artwork'}}
+		results = transfer.deliver(t, self.staging, self.depository, 'summer_sJJcK', plan)
+		self.assertTrue(all(r['error'] is None for r in results), results)
+		self.assertTrue((self.show / 'artwork' / 'clip.mp4').is_file())
+		self.assertTrue((self.show / 'plugins' / 'cue.tox').is_file())
+		self.assertTrue((self.show / 'plugins' / 'cue.json').is_file())
+		self.assertTrue((self.show / 'artwork' / 'piece' / 'media' / 'a.png').is_file())
+		self.assertFalse(t.exists())  # emptied transfer folder pruned
+
+	def test_unplanned_and_folder_plugin_stay_in_staging(self):
+		t = self.staging / 't2'
+		t.mkdir()
+		(t / 'stray.mov').write_bytes(b'v')
+		(t / 'dir').mkdir()
+		(t / 'dir' / 'x.tox').write_bytes(b'p')
+		results = {r['name']: r for r in transfer.deliver(
+			t, self.staging, self.depository, 'summer_sJJcK', {'items': {'dir': 'plugin'}})}
+		self.assertIn('not in the upload plan', results['stray.mov']['error'])
+		self.assertIn('must be a file', results['dir']['error'])
+		self.assertTrue((t / 'stray.mov').exists() and (t / 'dir').exists())
+
+	def test_collision_in_plugins_refused(self):
+		(self.show / 'plugins').mkdir()
+		(self.show / 'plugins' / 'cue.tox').write_bytes(b'old')
+		t = self.staging / 't3'
+		t.mkdir()
+		(t / 'cue.tox').write_bytes(b'new')
+		[r] = transfer.deliver(t, self.staging, self.depository, 'summer_sJJcK', {'items': {'cue.tox': 'plugin'}})
+		self.assertIn('already exists in summer_sJJcK/plugins', r['error'])
+		self.assertEqual((self.show / 'plugins' / 'cue.tox').read_bytes(), b'old')
+
+	def test_unknown_exhibition_refused_before_unzip(self):
+		t = self.staging / 't4'
+		t.mkdir()
+		make_zip(t / 'a.zip', {'x.png': b'i'})
+		with self.assertRaises(transfer.TransferError):
+			transfer.deliver(t, self.staging, self.depository, 'nope', {'unzip': ['a.zip'], 'items': {}})
+		self.assertTrue((t / 'a.zip').exists())
+
+	def test_zip_unpacked_and_routed(self):
+		t = self.staging / 't5'
+		t.mkdir()
+		make_zip(t / 'pack.zip', {'show/show.tox': b't', 'show/media/a.png': b'i',
+		                          'cue.tox': b'p', '__MACOSX/show/._a.png': b'junk'})
+		plan = {'unzip': ['pack.zip'], 'items': {'show': 'artwork', 'cue.tox': 'plugin'}}
+		results = transfer.deliver(t, self.staging, self.depository, 'summer_sJJcK', plan)
+		self.assertTrue(all(r['error'] is None for r in results), results)
+		self.assertTrue((self.show / 'artwork' / 'show' / 'media' / 'a.png').is_file())
+		self.assertTrue((self.show / 'plugins' / 'cue.tox').is_file())
+		self.assertFalse((self.show / 'artwork' / '__MACOSX').exists())
+
+
+class TestZip(Base):
+	def test_zip_slip_refused_and_nothing_left(self):
+		t = self.staging / 'z1'
+		t.mkdir()
+		make_zip(t / 'evil.zip', {'../../escape.txt': b'x'})
+		with self.assertRaises(transfer.TransferError):
+			transfer.extract_zip(t / 'evil.zip', self.staging)
+		self.assertEqual(sorted(p.name for p in t.iterdir()), ['evil.zip'])
+		self.assertFalse((self.staging.parent / 'escape.txt').exists())
+
+	def test_bad_zip_reported(self):
+		t = self.staging / 'z2'
+		t.mkdir()
+		(t / 'broken.zip').write_bytes(b'not a zip')
+		with self.assertRaises(transfer.TransferError):
+			transfer.extract_zip(t / 'broken.zip', self.staging)
+
+	def test_name_clash_beside_zip_refused(self):
+		t = self.staging / 'z3'
+		t.mkdir()
+		(t / 'a.png').write_bytes(b'old')
+		make_zip(t / 'p.zip', {'a.png': b'new'})
+		with self.assertRaises(transfer.TransferError):
+			transfer.extract_zip(t / 'p.zip', self.staging)
+		self.assertEqual((t / 'a.png').read_bytes(), b'old')
+		self.assertTrue((t / 'p.zip').exists())
+
+
+class TestToken(unittest.TestCase):
+	def test_created_once_and_reused(self):
+		with tempfile.TemporaryDirectory() as d:
+			p = Path(d) / 'sub' / 'token'
+			a = transfer.load_or_create_token(p)
+			b = transfer.load_or_create_token(p)
+			self.assertEqual(a, b)
+			self.assertRegex(a, r'^[a-z2-9]{4}(-[a-z2-9]{4}){3}$')
+
+	def test_matches(self):
+		self.assertTrue(transfer.token_matches('abc', 'abc'))
+		self.assertFalse(transfer.token_matches('abd', 'abc'))
+		self.assertFalse(transfer.token_matches('', ''))
+		self.assertFalse(transfer.token_matches(None, 'abc'))

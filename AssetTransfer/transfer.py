@@ -18,6 +18,8 @@ Queue events (all plain data):
   ('done',     transfer_id, {'ok': bool, 'cancelled': bool, 'returncode': int|None,
                              'entries': [entry...], 'error': str|None, 'log': [str]})
   ('moved',    job_id,      {'ok': bool, 'dest': str|None, 'error': str|None})
+  ('delivered', delivery_id, {'ok': bool, 'results': [{'name', 'kind', 'dest', 'error'}],
+                              'error': str|None})
 
 An entry is {'name', 'path', 'isDir', 'bytes'}.
 """
@@ -167,9 +169,29 @@ def _inside(child: Path, parent: Path) -> bool:
 # move
 # ---------------------------------------------------------------------------
 
+FOLDERS = ('artwork', 'plugins')
+
+
+def exhibition_dir(depository: os.PathLike, exhibition_id: str) -> Path:
+	"""exhibitions/<id>, or TransferError when the id is malformed or missing."""
+	if not exhibition_id or '/' in exhibition_id or '\\' in exhibition_id or exhibition_id in ('.', '..'):
+		raise TransferError('invalid exhibition id %r' % exhibition_id)
+	path = Path(depository) / 'exhibitions' / exhibition_id
+	if not path.is_dir():
+		raise TransferError('exhibition %s does not exist' % exhibition_id)
+	return path
+
+
 def move_to_artwork(src: os.PathLike, staging: os.PathLike, depository: os.PathLike,
                     exhibition_id: str) -> Path:
-	"""Move one staged file or folder into exhibitions/<id>/artwork/.
+	"""Move one staged file or folder into exhibitions/<id>/artwork/."""
+	return move_into(src, staging, depository, exhibition_id, 'artwork')
+
+
+def move_into(src: os.PathLike, staging: os.PathLike, depository: os.PathLike,
+              exhibition_id: str, folder: str) -> Path:
+	"""Move one staged file or folder into exhibitions/<id>/<folder>/, where
+	folder is 'artwork' or 'plugins'.
 
 	Refuses (TransferError) instead of overwriting, and refuses anything not
 	inside the staging root or an exhibition that does not exist. Same-drive
@@ -179,22 +201,19 @@ def move_to_artwork(src: os.PathLike, staging: os.PathLike, depository: os.PathL
 	destination path."""
 	src = Path(src)
 	staging = Path(staging)
+	if folder not in FOLDERS:
+		raise TransferError('invalid destination folder %r' % folder)
 	if not src.exists():
 		raise TransferError('%s is no longer in staging' % src.name)
 	if not _inside(src, staging):
 		raise TransferError('%s is outside the staging folder' % src)
-	if not exhibition_id or '/' in exhibition_id or '\\' in exhibition_id or exhibition_id in ('.', '..'):
-		raise TransferError('invalid exhibition id %r' % exhibition_id)
-	exhibition_dir = Path(depository) / 'exhibitions' / exhibition_id
-	if not exhibition_dir.is_dir():
-		raise TransferError('exhibition %s does not exist' % exhibition_id)
-
-	artwork = exhibition_dir / 'artwork'
-	artwork.mkdir(exist_ok=True)
-	dest = artwork / src.name
+	target = exhibition_dir(depository, exhibition_id) / folder
+	target.mkdir(exist_ok=True)
+	artwork = target  # name kept for the copy path below
+	dest = target / src.name
 	if dest.exists():
-		raise TransferError('%s already exists in %s/artwork -- rename or remove it first'
-		                    % (src.name, exhibition_id))
+		raise TransferError('%s already exists in %s/%s -- rename or remove it first'
+		                    % (src.name, exhibition_id, folder))
 
 	try:
 		os.rename(src, dest)  # same drive: atomic, no copy
@@ -211,7 +230,7 @@ def move_to_artwork(src: os.PathLike, staging: os.PathLike, depository: os.PathL
 		else:
 			shutil.copy2(src, partial)
 		if dest.exists():  # appeared while copying
-			raise TransferError('%s appeared in %s/artwork during the copy' % (src.name, exhibition_id))
+			raise TransferError('%s appeared in %s/%s during the copy' % (src.name, exhibition_id, folder))
 		os.replace(partial, dest)
 	except BaseException:
 		if partial.exists():
@@ -251,6 +270,168 @@ def _remove(path: Path) -> None:
 # ---------------------------------------------------------------------------
 # croc
 # ---------------------------------------------------------------------------
+
+JUNK_NAMES = {'__MACOSX', '.DS_Store', 'Thumbs.db', 'desktop.ini'}
+
+
+def extract_zip(zip_path: os.PathLike, staging: os.PathLike) -> List[str]:
+	"""Unpack a staged .zip into the folder that holds it and delete the zip.
+
+	Each top-level entry of the zip becomes a staged entry beside where the
+	zip was, so it can be routed like any other received item. Extraction
+	goes to a hidden temp folder first and the entries are renamed up only
+	when everything unpacked, so a failure never leaves half an archive in
+	staging. Refuses (TransferError): entries that would land outside the
+	folder (zip-slip), a top-level name that already exists, and an archive
+	larger than the free disk space. Returns the top-level names."""
+	import zipfile
+	zip_path = Path(zip_path)
+	if not _inside(zip_path, Path(staging)):
+		raise TransferError('%s is outside the staging folder' % zip_path)
+	folder = zip_path.parent
+	temp = folder / ('.unzip-%s' % zip_path.stem)
+	if temp.exists():
+		_remove(temp)
+	try:
+		with zipfile.ZipFile(zip_path) as zf:
+			members = [m for m in zf.infolist()
+			           if not (set(Path(m.filename).parts) & JUNK_NAMES)]
+			total = sum(m.file_size for m in members)
+			if total > shutil.disk_usage(folder).free * 0.95:
+				raise TransferError('%s needs %d MB to unpack and the drive does not have it'
+				                    % (zip_path.name, total // 1_000_000))
+			temp.mkdir()
+			for m in members:
+				target = (temp / m.filename).resolve()
+				if not _inside(target, temp) or Path(m.filename).is_absolute():
+					raise TransferError('%s contains an unsafe path: %s' % (zip_path.name, m.filename))
+			for m in members:
+				zf.extract(m, temp)
+	except zipfile.BadZipFile as e:
+		_remove(temp)
+		raise TransferError('%s is not a valid zip: %s' % (zip_path.name, e))
+	except BaseException:
+		_remove(temp)
+		raise
+	names = sorted(p.name for p in temp.iterdir() if p.name not in JUNK_NAMES)
+	clash = [n for n in names if (folder / n).exists()]
+	if clash:
+		_remove(temp)
+		raise TransferError('%s: %s already in staging beside the zip' % (zip_path.name, ', '.join(clash)))
+	for n in names:
+		os.rename(temp / n, folder / n)
+	_remove(temp)
+	zip_path.unlink()
+	return names
+
+
+def deliver(transfer_dir: os.PathLike, staging: os.PathLike, depository: os.PathLike,
+            exhibition_id: str, plan: Dict) -> List[Dict]:
+	"""Place everything one croc transfer received, following the sender's plan.
+
+	plan = {'unzip': [zip names to unpack first],
+	        'items': {top-level name: 'artwork' | 'plugin'}}
+
+	Folders always go to artwork/ (they keep their layout, so a .tox keeps
+	its relative asset paths). Plugins must be files. Anything the plan does
+	not name, or that cannot be placed, stays in staging with the reason, so
+	the operator can see and handle it. Returns one result per item:
+	{'name', 'kind', 'dest', 'error'}."""
+	transfer_dir = Path(transfer_dir)
+	exhibition_dir(depository, exhibition_id)  # refuse early, before unpacking
+	results = []
+	items = dict(plan.get('items') or {})
+	for name in plan.get('unzip') or []:
+		zp = transfer_dir / name
+		if Path(name).name != name or zp.suffix.lower() != '.zip' or not zp.is_file():
+			results.append({'name': name, 'kind': 'zip', 'dest': None,
+			                'error': 'zip not found in this transfer'})
+			continue
+		try:
+			extract_zip(zp, staging)
+		except TransferError as e:
+			results.append({'name': name, 'kind': 'zip', 'dest': None, 'error': str(e)})
+	for entry in staged_entries(transfer_dir):
+		name = entry['name']
+		kind = items.get(name)
+		result = {'name': name, 'kind': kind or '?', 'dest': None, 'error': None}
+		if kind not in ('artwork', 'plugin'):
+			result['error'] = 'not in the upload plan; left in staging'
+		elif kind == 'plugin' and entry['isDir']:
+			result['error'] = 'a plugin must be a file, not a folder; left in staging'
+		else:
+			try:
+				dest = move_into(entry['path'], staging, depository, exhibition_id,
+				                 'plugins' if kind == 'plugin' else 'artwork')
+				result['dest'] = str(dest)
+			except TransferError as e:
+				result['error'] = str(e)
+		results.append(result)
+	prune_empty_transfers(staging)
+	return results
+
+
+class DeliveryWorker(threading.Thread):
+	"""Runs deliver() off the main thread (unpacking and cross-drive moves can
+	take a while). Posts ('delivered', job_id, {'ok', 'results', 'error'})."""
+
+	def __init__(self, job_id: str, transfer_dir, staging, depository, exhibition_id,
+	             plan: Dict, events: 'queue.Queue'):
+		super().__init__(name='asset-deliver-%s' % job_id, daemon=True)
+		self.job_id = job_id
+		self.args = (transfer_dir, staging, depository, exhibition_id, plan)
+		self.events = events
+
+	def run(self) -> None:
+		try:
+			results = deliver(*self.args)
+			failed = [r for r in results if r['error']]
+			self.events.put(('delivered', self.job_id, {
+				'ok': not failed, 'results': results,
+				'error': ('%d of %d items not placed' % (len(failed), len(results))) if failed else None}))
+		except TransferError as e:
+			self.events.put(('delivered', self.job_id, {'ok': False, 'results': [], 'error': str(e)}))
+		except Exception as e:
+			self.events.put(('delivered', self.job_id, {'ok': False, 'results': [],
+			                                            'error': '%s: %s' % (type(e).__name__, e)}))
+
+
+# ---------------------------------------------------------------------------
+# API token
+# ---------------------------------------------------------------------------
+
+TOKEN_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789'  # no 0/o/1/l/i: read aloud safely
+
+
+def default_token_file() -> Path:
+	return Path.home() / '.asset-transfer' / 'token'
+
+
+def load_or_create_token(path: os.PathLike) -> str:
+	"""The token in `path`, creating a random one (xxxx-xxxx-xxxx-xxxx) the
+	first time. The file is readable by this user only where the OS allows."""
+	import secrets
+	path = Path(path)
+	try:
+		token = path.read_text(encoding='utf-8').strip()
+		if token:
+			return token
+	except FileNotFoundError:
+		pass
+	token = '-'.join(''.join(secrets.choice(TOKEN_ALPHABET) for _ in range(4)) for _ in range(4))
+	path.parent.mkdir(parents=True, exist_ok=True)
+	path.write_text(token + '\n', encoding='utf-8')
+	try:
+		os.chmod(path, 0o600)
+	except OSError:
+		pass
+	return token
+
+
+def token_matches(given: Optional[str], expected: str) -> bool:
+	import hmac
+	return bool(given) and bool(expected) and hmac.compare_digest(given.encode(), expected.encode())
+
 
 def parse_progress(line: str) -> Optional[int]:
 	"""Last percentage in a croc progress line, or None."""

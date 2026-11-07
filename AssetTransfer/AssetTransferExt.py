@@ -48,6 +48,10 @@ class AssetTransferExt:
 		self.Staged = []          # entries from transfer.all_staged
 		self.Exhibitions = []     # from transfer.list_exhibitions
 		self.Messages = []        # (time, level, text), newest last
+		self.Deliveries = {}      # delivery_id -> {exhibition, plan, transfer, state, ...}
+		self._deliveryOf = {}     # transfer_id -> delivery_id
+		self.ApiStatus = {'enabled': False, 'port': None, 'listening': False, 'reason': 'not checked yet'}
+		self._nextApiCheck = 0.0
 		self._jobSeq = 0
 		run('args[0].RefreshAll()', self, delayFrames=5)
 
@@ -77,7 +81,8 @@ class AssetTransferExt:
 		if found:
 			return [found]
 		if sys.platform == 'win32':
-			for candidate in (Path.home() / 'scoop' / 'shims' / 'croc.exe',
+			for candidate in (Path(os.environ.get('ProgramFiles', r'C:\Program Files')) / 'croc' / 'croc.exe',
+			                  Path.home() / 'scoop' / 'shims' / 'croc.exe',
 			                  Path(os.environ.get('ProgramData', r'C:\ProgramData')) / 'chocolatey' / 'bin' / 'croc.exe'):
 				if candidate.exists():
 					return [str(candidate)]
@@ -112,6 +117,57 @@ class AssetTransferExt:
 		worker.start()
 		self._message('info', 'Receiving transfer %s...' % tid)
 		return tid
+
+	# ---- deliveries (started by the send CLI through the api DAT) ---------------
+
+	@property
+	def ApiToken(self):
+		"""The token senders must present: the Token parameter when set,
+		otherwise one generated once and kept in ~/.asset-transfer/token."""
+		p = str(self.ownerComp.par.Token.eval()).strip()
+		return p if p else transfer.load_or_create_token(transfer.default_token_file())
+
+	def StartDelivery(self, code, exhibition_id, plan):
+		"""Receive with `code`, then place everything per `plan` into
+		`exhibition_id` with no operator step. Returns the delivery dict.
+		Raises ValueError with the reason when it refuses."""
+		depository = self.DepositoryFolder
+		if depository is None:
+			raise ValueError('depository not found on Control -- set the Depository folder parameter')
+		try:
+			transfer.exhibition_dir(depository, exhibition_id)
+		except transfer.TransferError as e:
+			raise ValueError(str(e))
+		if not isinstance(plan, dict) or not isinstance(plan.get('items'), dict):
+			raise ValueError('plan must be {"items": {name: "artwork"|"plugin"}, "unzip": [...]}')
+		bad = [k for k, v in plan['items'].items() if v not in ('artwork', 'plugin')]
+		if bad:
+			raise ValueError('unknown destination for %s' % ', '.join(bad))
+		tid = self.Receive(code)
+		if tid is None:
+			raise ValueError(self.Messages[-1][2] if self.Messages else 'receive refused')
+		self._jobSeq += 1
+		did = 'd%d-%s' % (self._jobSeq, tid)
+		self.Deliveries[did] = {'id': did, 'exhibition': exhibition_id, 'plan': plan, 'transfer': tid,
+		                        'state': 'receiving', 'percent': None, 'line': '', 'results': [],
+		                        'error': None, 'started': time.time()}
+		self._deliveryOf[tid] = did
+		plugins = [n for n, k in plan['items'].items() if k == 'plugin']
+		if plugins:
+			self._message('warn', 'Delivery %s will put %s into %s/plugins.' % (did, ', '.join(plugins), exhibition_id))
+		return self.DeliveryStatus(did)
+
+	def DeliveryStatus(self, delivery_id):
+		"""Plain-data snapshot of one delivery, or None."""
+		d = self.Deliveries.get(delivery_id)
+		if d is None:
+			return None
+		t = self.Transfers.get(d['transfer'], {})
+		out = {k: v for k, v in d.items() if k != 'plan'}
+		if d['state'] == 'receiving':
+			out['percent'] = t.get('percent')
+			out['line'] = t.get('line') or ''
+		return out
 
 	def Cancel(self, transfer_id=None):
 		"""Cancel one receive, or every running receive when no id is given."""
@@ -182,6 +238,9 @@ class AssetTransferExt:
 
 	def Tick(self):
 		"""Drain worker events. Main thread only (exec_frame)."""
+		if time.time() >= self._nextApiCheck:
+			self._nextApiCheck = time.time() + 2.0
+			self._checkApi()
 		changed = False
 		staged = False
 		for _ in range(200):  # bounded per frame
@@ -214,6 +273,25 @@ class AssetTransferExt:
 					t['state'] = 'cancelled' if data['cancelled'] else 'failed'
 					self._message('warn' if data['cancelled'] else 'error',
 					              'Transfer %s: %s' % (key, data['error']))
+				did = self._deliveryOf.pop(key, None)
+				if did is not None:
+					self._startDelivering(did, data)
+				staged = True
+			elif kind == 'delivered':
+				d = self.Deliveries.get(key)
+				if d is not None:
+					d['state'] = 'done' if data['ok'] else 'failed'
+					d['results'] = data['results']
+					d['error'] = data['error']
+				for r in data['results']:
+					if r['error']:
+						self._message('error', '%s: %s' % (r['name'], r['error']))
+					else:
+						self._message('info', 'Placed %s in %s.' % (r['name'], r['dest']))
+				if data['error'] and not data['results']:
+					self._message('error', 'Delivery %s failed: %s' % (key, data['error']))
+				if any(r['dest'] and r['kind'] == 'artwork' for r in data['results']):
+					self._message('info', 'Run the artwork scan in Control to add the new artwork.')
 				staged = True
 			elif kind == 'moved':
 				m = self.Moves.get(key, {})
@@ -240,6 +318,63 @@ class AssetTransferExt:
 			self.RefreshAll()
 		elif name == 'Openstaging':
 			self.OpenStaging()
+
+	def _checkApi(self):
+		"""Is the api Web Server DAT really accepting connections, and on which
+		port? The port comes from the DAT itself, so a value pushed in by the
+		host Engine COMP shows here, not the .tox default. A localhost connect
+		is answered or refused at once, so this never stalls the frame."""
+		import socket
+		api = self.ownerComp.op('api')
+		status = {'enabled': bool(self.ownerComp.par.Apienable.eval()), 'port': None,
+		          'listening': False, 'reason': ''}
+		if api is None:
+			status['reason'] = 'api DAT missing'
+		else:
+			status['port'] = int(api.par.port.eval())
+			if not status['enabled']:
+				status['reason'] = 'turned off (Enable API)'
+			else:
+				s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+				s.settimeout(0.2)
+				try:
+					status['listening'] = s.connect_ex(('127.0.0.1', status['port'])) == 0
+				except OSError as e:
+					status['reason'] = str(e)
+				finally:
+					s.close()
+				# Something answering is not proof it is us (another program can
+				# hold the port), so the DAT must also report no error or warning.
+				problems = ' '.join(x for x in (api.errors(), api.warnings()) if x).strip()
+				if problems:
+					status['listening'] = False
+					status['reason'] = problems
+				elif not status['listening'] and not status['reason']:
+					status['reason'] = 'nothing accepted a connection on that port'
+		if status != self.ApiStatus:
+			self.ApiStatus = status
+			if status['listening']:
+				self._message('info', 'Send CLI API listening on port %d.' % status['port'])
+			elif status['enabled']:
+				self._message('error', 'Send CLI API NOT listening on port %s: %s' % (status['port'], status['reason']))
+			self._notify()
+
+	def _startDelivering(self, did, data):
+		d = self.Deliveries.get(did)
+		if d is None:
+			return
+		if not data['ok']:
+			d['state'] = 'failed'
+			d['error'] = data['error']
+			return
+		depository = self.DepositoryFolder
+		if depository is None:
+			d['state'] = 'failed'
+			d['error'] = 'depository not found on Control; files left in staging'
+			return
+		d['state'] = 'delivering'
+		transfer.DeliveryWorker(did, self.StagingFolder / d['transfer'], self.StagingFolder, depository,
+		                        d['exhibition'], d['plan'], self._events).start()
 
 	# ---- helpers ----------------------------------------------------------------
 

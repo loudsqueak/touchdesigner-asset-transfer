@@ -185,6 +185,14 @@ class UiExt:
 		if host is None or not host.extensionsReady:
 			return
 		ext = host.ext.AssetTransfer
+		st = ext.ApiStatus
+		if not st['enabled']:
+			api, rgb = 'send CLI off (Api page)', GREY
+		elif st['listening']:
+			api, rgb = 'SEND CLI  http://%s:%d   token %s   listening' % (self._address(), st['port'], ext.ApiToken), OK_GREEN
+		else:
+			api, rgb = 'SEND CLI  port %s NOT listening: %s' % (st['port'], st['reason']), RED
+		self._setText(ui.op('hdr_transfers'), _clip('TRANSFERS'.ljust(22) + api, 118), rgb)
 		self._paintTransfers(ext.Transfers)
 		self._paintStaged(ext.Staged, ext.Exhibitions, ext.Moves)
 		self._paintLog(ext.Messages)
@@ -318,6 +326,22 @@ class UiExt:
 		self.Paint()
 
 	# ---- helpers ------------------------------------------------------------------
+
+	def _address(self) -> str:
+		"""This machine's LAN address, for senders to type. Cached; connecting a
+		UDP socket sends no packets, it only picks the outgoing interface."""
+		if getattr(self, '_lanAddress', None) is None:
+			import socket
+			try:
+				s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+				try:
+					s.connect(('10.255.255.255', 1))
+					self._lanAddress = s.getsockname()[0]
+				finally:
+					s.close()
+			except OSError:
+				self._lanAddress = socket.gethostname()
+		return self._lanAddress
 
 	def _choices(self) -> Dict[str, str]:
 		return dict(self.ownerComp.fetch(CHOICES_KEY, {}, search=False))
