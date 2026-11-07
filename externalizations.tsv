@@ -1,0 +1,7 @@
+path	type	strategy	rel_file_path	timestamp	dirty	build	touch_build	node_x	node_y	node_color
+/externalizations	table	tsv	externalizations.tsv	2026-11-07 00:34:10 UTC				125	-500	0.9000,0.3000,0.4000
+/AssetTransfer/transfer	text	py	AssetTransfer/transfer.py	2026-11-07 00:35:14 UTC				-400	0	0.9000,0.3000,0.4000
+/AssetTransfer/AssetTransferExt	text	py	AssetTransfer/AssetTransferExt.py	2026-11-07 00:38:50 UTC				0	0	0.9000,0.3000,0.4000
+/AssetTransfer/exec_frame	execute	py	AssetTransfer/exec_frame.py	2026-11-07 00:38:50 UTC				0	-200	0.9000,0.3000,0.4000
+/AssetTransfer/parexec_assettransfer	parexec	py	AssetTransfer/parexec_assettransfer.py	2026-11-07 00:38:50 UTC				0	-400	0.9000,0.3000,0.4000
+/AssetTransfer/ui/UiExt	text	py	AssetTransfer/ui/UiExt.py	2026-11-07 00:44:26 UTC				-400	0	0.9000,0.3000,0.4000
