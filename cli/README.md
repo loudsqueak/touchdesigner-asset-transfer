@@ -9,6 +9,15 @@ needed, and puts each one in place. Nothing on Control is ever overwritten.
 Needs [Bun](https://bun.sh) and croc (`brew install croc` on macOS). It has no
 other dependencies.
 
+To run it from anywhere as `transfer`, link it onto your PATH once:
+
+```sh
+ln -s "$PWD/cli/transfer" ~/.local/bin/transfer   # from the repo root
+transfer               # the wizard  (= bun run cli)
+transfer send ...      # scriptable  (= bun run send ...)
+transfer setup         #             (= bun run setup)
+```
+
 ## One-time setup
 
 The Asset Transfer panel on Control shows a line like

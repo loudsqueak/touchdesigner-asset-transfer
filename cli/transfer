@@ -1,0 +1,13 @@
+#!/bin/sh
+# `transfer` from anywhere: link this file onto your PATH (see README).
+#   transfer              the wizard
+#   transfer send [...]   scriptable send (transfer send -h)
+#   transfer setup        addresses and tokens
+dir=$(dirname "$(readlink -f "$0")")
+case "$1" in
+  send)  shift; exec bun "$dir/src/send.ts" "$@" ;;
+  setup) shift; exec bun "$dir/src/setup.ts" "$@" ;;
+  -h|--help|help) sed -n '3,5p' "$0" | sed 's/^# *//' ;;
+  "")    exec bun "$dir/src/tui.ts" ;;
+  *)     echo "unknown command: $1 (try: transfer, transfer send, transfer setup)" >&2; exit 2 ;;
+esac
